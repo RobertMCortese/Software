@@ -14,16 +14,9 @@ CAPTURE_DIR = "."            # where capture files are saved
 
 # --- GPIO Setup ---
 REC_LED_PIN = 23   # Recording LED
-IDLE_LED_PIN = 2   # Idle LED
-BUTTON_PIN = 17    # Toggle button
-
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(REC_LED_PIN, GPIO.OUT)
-GPIO.setup(IDLE_LED_PIN, GPIO.OUT)
-GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-
 GPIO.output(REC_LED_PIN, GPIO.LOW)
-GPIO.output(IDLE_LED_PIN, GPIO.HIGH)  # idle at startup
 
 # --- FireWire Setup ---
 handle = raw1394.Raw1394()
@@ -58,20 +51,20 @@ def check_recording():
     else:
         return f"Unknown (0x{status:02X})"
 
-def get_recording_time_remaining():
-    """Return remaining recording time in seconds (after buffer)."""
-    total, used, free = shutil.disk_usage(CAPTURE_DIR)
-    free_mb = free / (1024*1024)
-    free_mb -= SAFETY_BUFFER_MB
-    if free_mb <= 0:
-        return 0
-    seconds = free_mb / DV_MBYTES_PER_SEC
-    return int(seconds)
-
 ffmpeg_proc = None
+record_start_time = None
+initial_secs_remaining = None
+
+def calculate_remaining_time():
+    """Estimate remaining recording time based on start free space and elapsed time."""
+    if record_start_time is None or initial_secs_remaining is None:
+        return 0
+    elapsed = time.time() - record_start_time
+    est_remaining = initial_secs_remaining - int(elapsed)
+    return max(est_remaining, 0)
 
 def start_capture():
-    global ffmpeg_proc
+    global ffmpeg_proc, record_start_time, initial_secs_remaining
     if ffmpeg_proc is None:
         print("▶ Starting FFmpeg capture...")
         filename = os.path.join(CAPTURE_DIR, f"capture_{int(time.time())}.dv")
@@ -82,63 +75,57 @@ def start_capture():
         ])
         GPIO.output(REC_LED_PIN, GPIO.HIGH)
 
+        # Compute initial space & time left once
+        total, used, free = shutil.disk_usage(CAPTURE_DIR)
+        free_mb = free / (1024*1024)
+        free_mb -= SAFETY_BUFFER_MB
+        if free_mb < 0:
+            free_mb = 0
+        initial_secs_remaining = int(free_mb / DV_MBYTES_PER_SEC)
+        record_start_time = time.time()
+        mins, sec = divmod(initial_secs_remaining, 60)
+        print(f"⏱ Initial recording time available: {mins}m {sec}s")
+
 def stop_capture():
-    global ffmpeg_proc
+    global ffmpeg_proc, record_start_time, initial_secs_remaining
     if ffmpeg_proc is not None:
         print("■ Stopping FFmpeg capture...")
         ffmpeg_proc.send_signal(signal.SIGINT)
         ffmpeg_proc.wait()
         ffmpeg_proc = None
         GPIO.output(REC_LED_PIN, GPIO.LOW)
-
-# --- Polling Toggle ---
-polling_enabled = False   # OFF by default
-last_state = None
-
-def toggle_polling(channel):
-    global polling_enabled, last_state
-    polling_enabled = not polling_enabled
-    if polling_enabled:
-        print("✅ Polling ENABLED")
-        GPIO.output(IDLE_LED_PIN, GPIO.LOW)
-    else:
-        print("❌ Polling DISABLED (Idle)")
-        stop_capture()
-        GPIO.output(IDLE_LED_PIN, GPIO.HIGH)
-        GPIO.output(REC_LED_PIN, GPIO.LOW)
-    last_state = None
-
-GPIO.add_event_detect(BUTTON_PIN, GPIO.FALLING, callback=toggle_polling, bouncetime=500)
+    record_start_time = None
+    initial_secs_remaining = None
 
 # --- Main Loop ---
-print("Press button to toggle AV/C polling. Ctrl+C to quit.")
-print("❌ Polling DISABLED (Idle)")  # startup status
+print("Polling camcorder state. Ctrl+C to quit.")
+last_state = None
 last_report = 0
 
 try:
     while True:
-        if polling_enabled:
-            state = check_recording()
-            if state != last_state:
-                print(f"Camcorder state: {state}")
-                if state == "Recording":
-                    start_capture()
-                elif state == "Stopped":
-                    stop_capture()
-            last_state = state
-
-            # If recording, check disk space every 10s
+        state = check_recording()
+        if state != last_state:
+            print(f"Camcorder state: {state}")
             if state == "Recording":
-                now = time.time()
-                if now - last_report >= 10:
-                    secs = get_recording_time_remaining()
-                    mins, sec = divmod(secs, 60)
-                    print(f"⏱ Recording time remaining: {mins}m {sec}s")
+                start_capture()
+            elif state == "Stopped":
+                stop_capture()
+        last_state = state
 
-                    if secs <= 0:
-                        print("⚠️ Storage almost full! Auto-stopping capture.")
-                        stop_capture()
-                    last_report = now
+        # If recording, report estimated time left every 10s
+        if state == "Recording" and record_start_time is not None:
+            now = time.time()
+            if now - last_report >= 10:
+                secs = calculate_remaining_time()
+                mins, sec = divmod(secs, 60)
+                print(f"⏱ Recording time remaining: {mins}m {sec}s")
+
+                if secs <= 0:
+                    print("⚠️ Storage almost full! Auto-stopping capture.")
+                    stop_capture()
+                last_report = now
+
         time.sleep(1)
 
 except KeyboardInterrupt:
